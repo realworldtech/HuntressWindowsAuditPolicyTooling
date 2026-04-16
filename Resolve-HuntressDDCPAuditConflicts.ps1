@@ -2,6 +2,7 @@
 param(
     [string]$TargetDomain,
     [switch]$AllDomains,
+    [switch]$RemoveOverAuditingConflicts,
     [string]$BackupRoot = "$env:TEMP\DDCP-AuditPolicy-Backups"
 )
 
@@ -25,6 +26,17 @@ $conflictingSubcategories = @(
     "User Account Management",
     "Special Logon"
 )
+
+$expectedAuditValues = @{
+    "Account Lockout"                = 2
+    "Application Group Management"   = 0
+    "Computer Account Management"    = 3
+    "Distribution Group Management"  = 3
+    "Other Logon/Logoff Events"      = 3
+    "Security Group Management"      = 3
+    "User Account Management"        = 3
+    "Special Logon"                  = 1
+}
 
 function Get-UpdatedMachineVersion {
     param([int]$CurrentVersionNumber)
@@ -87,6 +99,60 @@ function Get-NormalizedSubcategoryName {
     }
 
     return (($Subcategory -replace '^Audit\s+', '').Trim())
+}
+
+function Convert-AuditValueToText {
+    param([int]$Value)
+
+    switch ($Value) {
+        0 { "No Auditing" }
+        1 { "Success" }
+        2 { "Failure" }
+        3 { "Success and Failure" }
+        default { throw "Unsupported audit value: $Value" }
+    }
+}
+
+function Convert-AuditRowToValue {
+    param($Row)
+
+    if (-not [string]::IsNullOrWhiteSpace($Row.'Setting Value')) {
+        return [int]$Row.'Setting Value'
+    }
+
+    $inclusionSetting = if ($null -eq $Row.'Inclusion Setting') { '' } else { ([string]$Row.'Inclusion Setting').Trim() }
+
+    switch ($inclusionSetting) {
+        'No Auditing'         { return 0 }
+        'Success'             { return 1 }
+        'Failure'             { return 2 }
+        'Success and Failure' { return 3 }
+        default { throw "Unsupported audit row setting for subcategory '$($Row.Subcategory)'" }
+    }
+}
+
+function Get-AuditDifferenceClassification {
+    param(
+        [int]$ExpectedValue,
+        [int]$ActualValue
+    )
+
+    if ($ExpectedValue -eq $ActualValue) {
+        return 'Match'
+    }
+
+    $hasAllExpectedBits = (($ActualValue -band $ExpectedValue) -eq $ExpectedValue)
+    $hasOnlyExpectedBits = (($ActualValue -band (-bnot $ExpectedValue)) -eq 0)
+
+    if ($hasAllExpectedBits -and -not $hasOnlyExpectedBits) {
+        return 'Over-auditing only'
+    }
+
+    if ($hasOnlyExpectedBits -and -not $hasAllExpectedBits) {
+        return 'Under-auditing'
+    }
+
+    return 'Different mode'
 }
 
 function Set-AuditCsvRows {
@@ -161,10 +227,55 @@ function Resolve-DDCPAuditConflictsForDomain {
         }
     }
 
-    Write-Host ("  Conflicting subcategories found: {0}" -f (($matches.Subcategory | Sort-Object -Unique) -join ', ')) -ForegroundColor Yellow
+    $classifiedMatches = @(
+        foreach ($row in $matches) {
+            $name = Get-NormalizedSubcategoryName -Subcategory $row.Subcategory
+            $actualValue = Convert-AuditRowToValue -Row $row
+            $expectedValue = [int]$expectedAuditValues[$name]
+            [pscustomobject]@{
+                Row            = $row
+                Name           = $name
+                ActualValue    = $actualValue
+                ExpectedValue  = $expectedValue
+                Classification = Get-AuditDifferenceClassification -ExpectedValue $expectedValue -ActualValue $actualValue
+            }
+        }
+    )
+
+    $rowsToRemove = @(
+        $classifiedMatches | Where-Object {
+            $RemoveOverAuditingConflicts -or $_.Classification -ne 'Over-auditing only'
+        }
+    )
+
+    Write-Host ("  Overlapping DDCP subcategories found: {0}" -f (($matches.Subcategory | Sort-Object -Unique) -join ', ')) -ForegroundColor Yellow
+
+    foreach ($item in $classifiedMatches) {
+        Write-Host ("    - {0}: DDCP='{1}', Huntress='{2}' [{3}]" -f `
+            $item.Name,
+            (Convert-AuditValueToText -Value $item.ActualValue),
+            (Convert-AuditValueToText -Value $item.ExpectedValue),
+            $item.Classification) -ForegroundColor DarkYellow
+    }
+
+    if ($rowsToRemove.Count -eq 0) {
+        Write-Host "  All overlapping DDCP rows are over-auditing-only supersets; leaving them untouched by default." -ForegroundColor Green
+        return [pscustomobject]@{
+            Domain = $DomainFQDN
+            Removed = 0
+            Remaining = $rows.Count
+            Changed = $false
+        }
+    }
 
     if ($explicitWhatIf) {
-        Write-Host ("[WhatIf] Would remove {0} overlapping row(s) from {1}" -f $matches.Count, $ddcpName) -ForegroundColor DarkYellow
+        Write-Host ("[WhatIf] Would remove {0} DDCP row(s) from {1}" -f $rowsToRemove.Count, $ddcpName) -ForegroundColor DarkYellow
+        if (-not $RemoveOverAuditingConflicts) {
+            $leftInPlace = @($classifiedMatches | Where-Object { $_.Classification -eq 'Over-auditing only' })
+            if ($leftInPlace.Count -gt 0) {
+                Write-Host ("[WhatIf] Over-auditing-only rows left in place: {0}" -f ($leftInPlace.Name -join ', ')) -ForegroundColor DarkYellow
+            }
+        }
     }
 
     if (-not $CallerCmdlet.ShouldProcess("$ddcpName in $DomainFQDN", "Remove overlapping Huntress audit settings")) {
@@ -183,7 +294,7 @@ function Resolve-DDCPAuditConflictsForDomain {
 
     $newRows = @(
         $rows | Where-Object {
-            (Get-NormalizedSubcategoryName -Subcategory $_.Subcategory) -notin $conflictingSubcategories
+            $_ -notin $rowsToRemove.Row
         }
     )
     Set-AuditCsvRows -Path $auditCsvPath -Rows $newRows
@@ -193,12 +304,12 @@ function Resolve-DDCPAuditConflictsForDomain {
     Set-ADObject -Identity $gpoDn -Server $DomainFQDN -Replace @{ versionNumber = $newVersion }
     Update-GptIniVersion -Path $gptIniPath -Version $newVersion
 
-    Write-Host ("  Removed {0} row(s) from DDCP audit.csv" -f $matches.Count) -ForegroundColor Green
+    Write-Host ("  Removed {0} row(s) from DDCP audit.csv" -f $rowsToRemove.Count) -ForegroundColor Green
     Write-Host ("  New machine row count: {0}" -f $newRows.Count) -ForegroundColor DarkGreen
 
     return [pscustomobject]@{
         Domain = $DomainFQDN
-        Removed = $matches.Count
+        Removed = $rowsToRemove.Count
         Remaining = $newRows.Count
         Changed = $true
     }
@@ -215,6 +326,7 @@ if ($explicitWhatIf) {
     Write-Host ("[WhatIf] Target domain(s): {0}" -f ($domains -join ', ')) -ForegroundColor DarkYellow
     Write-Host ("[WhatIf] GPO: {0}" -f $ddcpName) -ForegroundColor DarkYellow
     Write-Host ("[WhatIf] Subcategories to remove: {0}" -f ($conflictingSubcategories -join ', ')) -ForegroundColor DarkYellow
+    Write-Host ("[WhatIf] Remove over-auditing-only conflicts: {0}" -f $RemoveOverAuditingConflicts) -ForegroundColor DarkYellow
     Write-Host ("[WhatIf] Backup root: {0}" -f $BackupRoot) -ForegroundColor DarkYellow
 }
 
@@ -251,8 +363,8 @@ if ($results.Count -gt 0) {
 # SIG # Begin signature block
 # MIIyhQYJKoZIhvcNAQcCoIIydjCCMnICAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBrN0F2u6IPArSm
-# eYSPBsDSQzO/QyEyvQLwxyVIoZogpKCCK7QwggVvMIIEV6ADAgECAhBI/JO0YFWU
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBslNHONDmkE7q/
+# GquWS2XS1ejA00Q7PWRrqx9JurxlnaCCK7QwggVvMIIEV6ADAgECAhBI/JO0YFWU
 # jTanyYqJ1pQWMA0GCSqGSIb3DQEBDAUAMHsxCzAJBgNVBAYTAkdCMRswGQYDVQQI
 # DBJHcmVhdGVyIE1hbmNoZXN0ZXIxEDAOBgNVBAcMB1NhbGZvcmQxGjAYBgNVBAoM
 # EUNvbW9kbyBDQSBMaW1pdGVkMSEwHwYDVQQDDBhBQUEgQ2VydGlmaWNhdGUgU2Vy
@@ -489,34 +601,33 @@ if ($results.Count -gt 0) {
 # CQYDVQQGEwJHQjEYMBYGA1UEChMPU2VjdGlnbyBMaW1pdGVkMSswKQYDVQQDEyJT
 # ZWN0aWdvIFB1YmxpYyBDb2RlIFNpZ25pbmcgQ0EgUjM2AhEAyu6yTXnXONjJZZfx
 # EYG4QDANBglghkgBZQMEAgEFAKBqMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEE
-# MBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCB+
-# /6RCBJW84mVrbmZ7kWIyFvPZ3M9czT3KRHmeY5U16zANBgkqhkiG9w0BAQEFAASC
-# AgBMJr2/iK3XrhBl6s/XQThlMCxewKCZobStPb8sf7OKxQYIufT3YkshWPbL4WFl
-# qgI0NYupmOUXK9nsi2Nk5jJjihSUCxaxjbVINXS6DVa36c1r3n6spnP8MT8XC228
-# oL7TTyVjBcRfRHhqAhDhg86NvJLUR3wYf9b1+uRoIF82CLinXlPcdSOADiCbXAxE
-# l9imTFa9gBppL4r2oB0lPod+kiQaYqySnphAAY8lii3toIfUeFhYm6BqCUwUKQT/
-# FsYiDkaxbUDo6Y7TeRvxJwH5ypxS4NSNawobYPjhPRlUn2TsbghUJapRXWZkIh2J
-# Snospl5681BV6vOHfDRT/mmJVhQC3BLzJ6tHct6/iQurWxxE6LStUZGuDhY3kc78
-# G2Dre6Ou5W1I/kIklRJsiCaSdCYcpdhKG9nriYD8low/8X93JkFeW9cn1V8tDFLD
-# +TI54NkJPP6kc7nUf7D08t/htWryTc4GnlD/K+yCdowYbCxympeR37PQDN4d3zN8
-# ITqiEmqjfUj1L/uLiu1xXfN+0Vg9unnv2yu20xlh3sLwvLnDVNbljpAVIcQhIe2R
-# aGnAhZbZU1sLQDL+tWylsGnVa7SGHhE1nBK3wWh5Xm11V1RSSZ6x5Wi+CMLSpYpY
-# 5nHSUkmxA2Q1gOew5IcTw19FHmsuayDuei3c1OEt3DFz4qGCAyMwggMfBgkqhkiG
+# MBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCB7
+# 5BCJSdW0b+Ua/5hR9Oq5RtQTFIwwwJczdYEJVDnd7zANBgkqhkiG9w0BAQEFAASC
+# AgCfApm2K4dfIRPG6Xk1RfEzhDAUvccT775JD/DwnpidwymmjdrZYlB/arko/Kdt
+# 1DhnAoQEBGhCCYcWT2NePqbEtxPCsbFyDnD89wZvZXlc6t3uaeysAH+biVrWnu18
+# Tw15dhWUE+tpm1e7EaM7q4/I38vk+FoXMJHpqCB6QheJHswGG/LBkVO+Lc3dPEnN
+# bemGnCxllpRzemjzWnPqdrEtyymUZnvNq/GuHUKfr7KFJyLisnYJCYHQkdc3hv0a
+# ojq/0wK2icOlmF3mSbxyhT6BwwMj9dcv6sIIy02xF9p6eL6m8Wavp8ms5+VPwyk9
+# 0MBxalxQP8mYP/N4dXY26NEwqw4E6dGY/fvJZBbzxcryrxo8aYzswddQkzABm9ZP
+# MoxT0VU9HG2KqcV9lIRJ0ZH9WLwWXusP96O0VDAxPLEfSis4VNcnVbyx85Esw1GU
+# Fb5kexNH8BE7JGBg/o/XJlHFHrCUKmTSRWIXG8eGrixA/j1CtSTSoXLxEu/UXgKK
+# +ttu6KuWntilfya79bHJmJvOp1T+dUkllrMGmasHLfL90rj2nylhYl4uktYkEv91
+# l+0TAo5hEAGQSJaSrdyM4n5jb+baiMwuCmbPzY4PqUNkFqGCAyMwggMfBgkqhkiG
 # 9w0BCQYxggMQMIIDDAIBATBqMFUxCzAJBgNVBAYTAkdCMRgwFgYDVQQKEw9TZWN0
 # aWdvIExpbWl0ZWQxLDAqBgNVBAMTI1NlY3RpZ28gUHVibGljIFRpbWUgU3RhbXBp
 # bmcgQ0EgUjM2AhEApCk7bh7d16c0CIetek63JDANBglghkgBZQMEAgIFAKB5MBgG
-# CSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MDQxNjE0
-# MTMwNFowPwYJKoZIhvcNAQkEMTIEMP1i5RMrexQ3/junBGjpVxiyNj7/VnaoGjhY
-# PLPkC9i3oWdJqX7/2C086KjLeXozpTANBgkqhkiG9w0BAQEFAASCAgB6Bq32q9hN
-# q9UatlEKrGLT3e7l+nCCLmlf9rO4BPTALKiVANf7Rp6jZdRdXdFWGuhbAvCq5SCa
-# Y7U3ArlCJOb+eJQxMf58RSzkw8/zRBV2REFB3RscL+pxiwsJkgz5a9+B+aBHrGMN
-# THbC4Cun5qhvYS4KGh8jnCjCriOvwS8fEFnDgCd38dqs/2/rQw3nO5CyuT1pCHGL
-# aM0hgoqqoRFUrTIjeeC6M+lNVvk+RuE2gEEbdIcqCXG1lKIzNippDjz5Z6A0OWap
-# 1FAARJ6teVZ/IvxFqxdCCrAdOes1Q9hjkdo+aEv57YiMuWLwvKZWibZQgnbqS4fM
-# i2dqnDYVy+fYDtZ2a/TDs1a/qHSB+Q9cRtrwzsd3UiZ6ZO+7lHSlAgVqBjIWs+1I
-# 3VUjqHeqDYw31xiOuqrw6gl8ZtL6wTkv/PGQrWcjdKKUGjOf8IOig21aYJOXOcfN
-# Sd/IraGlTAyQeM+Xt8WSFpS6mqAVN0D5VBZS+vTZN0stCj1JKopVnNC6RFzHbb9M
-# Np5dtT/k3uhrFbW9dZ27FqpMElJw7lOEQYCWQljnwm0uaB7B1gVC97EspAQs5ofo
-# xxF9KSH70yQ2O0ABK2WdH5sZ7qDbQanoEJRpPBjQrL7HHTVdBxiDMu+rcqgyohv6
-# Vbz5k9ZwLqAaRhl5RCQJpVxCyCp5R7ffmw==
+# CSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MDQxNjE1
+# MjcxM1owPwYJKoZIhvcNAQkEMTIEMOCnb6L9MHfRu0xCNWydjACwx/qfbCp4qCrp
+# aK+c2qErzsR3RJgfCZaAA84nx7wPJDANBgkqhkiG9w0BAQEFAASCAgAJcSAUMpXH
+# 08rsk0FW8TSQOEz0U1kRcLNoWOUJuYs8jG53UiFXUUCgW0zggtHXS8wCbJSjb1fc
+# MkDCD1ms1g93ADPdodF8j+wN6+d8zofFfB9Fmf3PEgMryZ6dSnVWyCGxmfF4d0ly
+# J9mntUtJ4IaMg9AQ10gT+tztHF2UZ2EWr/IHP6GfYXBeqPMBLl4P7DH01lh/zOI1
+# UN+72etW5Fh4M23emPHD01aFJxVIkUV40JHfhJOcbbK2/tFzBo6OwsaJs+DbdSIn
+# qI86fkah5m8uIupJKdxkaYphSONUxXR6Kqrd97GwbrDuZ8SSBktdrWZ/HVjJDJfy
+# SwnOVo9rg6tz2bdwyqqIkRO2jjzV/8TxZans2vxLws+UYuap8JoGQ1zFwe0R2osr
+# zC/hf7i76vq4z0r14UzbWF1CM2/L1Awsj11JSYqJH5e2OWc/7CR8g5Ss2zpctHAc
+# MqUA1yW5In+vC+fE9SnHpJKx+t9KYGAdImN7bBEOT+NTAIuUvoCrkAYxLe+qjQem
+# 3rQ/N7cJG7qWx8KDul5OLsn5ucCkVrWWpe6tZMzadCp3J88wUfP+qzujg+LaLXiM
+# 4W2Z59HkSbrKj8ulns3cTChnrgjWh7IfJ2lTc3Ix3iAXfy4KqO997qDGfXZ8O1KJ
+# Npuse0harM/SHVEu7UwkcP8DFhUWV5xmWw==
 # SIG # End signature block

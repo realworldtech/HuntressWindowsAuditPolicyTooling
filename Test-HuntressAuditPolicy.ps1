@@ -200,6 +200,42 @@ function Get-ExpectedAuditMap {
     return $map
 }
 
+function Get-AuditDifferenceClassification {
+    param(
+        [int]$ExpectedValue,
+        [int]$ActualValue
+    )
+
+    if ($ExpectedValue -eq $ActualValue) {
+        return [pscustomobject]@{
+            Classification = 'Match'
+            Summary        = 'Matches baseline'
+        }
+    }
+
+    $hasAllExpectedBits = (($ActualValue -band $ExpectedValue) -eq $ExpectedValue)
+    $hasOnlyExpectedBits = (($ActualValue -band (-bnot $ExpectedValue)) -eq 0)
+
+    if ($hasAllExpectedBits -and -not $hasOnlyExpectedBits) {
+        return [pscustomobject]@{
+            Classification = 'Over-auditing only'
+            Summary        = 'Logs all expected events plus additional ones'
+        }
+    }
+
+    if ($hasOnlyExpectedBits -and -not $hasAllExpectedBits) {
+        return [pscustomobject]@{
+            Classification = 'Under-auditing'
+            Summary        = 'Missing part or all of the expected audit coverage'
+        }
+    }
+
+    return [pscustomobject]@{
+        Classification = 'Different mode'
+        Summary        = 'Misses expected coverage and also logs an unexpected mode'
+    }
+}
+
 function Resolve-InputFormat {
     param(
         [string]$Content,
@@ -696,6 +732,8 @@ function Compare-AuditPolicy {
                 ExpectedValue = $expected.Value
                 Actual        = $actual.ValueText
                 ActualValue   = $actual.Value
+                Classification = (Get-AuditDifferenceClassification -ExpectedValue $expected.Value -ActualValue $actual.Value).Classification
+                Impact        = (Get-AuditDifferenceClassification -ExpectedValue $expected.Value -ActualValue $actual.Value).Summary
             })
         }
     }
@@ -759,8 +797,18 @@ if ($result.MismatchCount -gt 0) {
     Write-Host ""
     Write-Host "Mismatched subcategories:" -ForegroundColor Yellow
     foreach ($item in $result.Mismatches) {
-        Write-Host ("  - {0}: expected '{1}', found '{2}'" -f $item.Name, $item.Expected, $item.Actual)
+        Write-Host ("  - {0}: expected '{1}', found '{2}' [{3}]" -f $item.Name, $item.Expected, $item.Actual, $item.Classification)
     }
+
+    $overAuditingOnly = @($result.Mismatches | Where-Object { $_.Classification -eq 'Over-auditing only' })
+    $underAuditing = @($result.Mismatches | Where-Object { $_.Classification -eq 'Under-auditing' })
+    $differentMode = @($result.Mismatches | Where-Object { $_.Classification -eq 'Different mode' })
+
+    Write-Host ""
+    Write-Host "Mismatch triage:" -ForegroundColor Yellow
+    Write-Host ("  - Over-auditing only: {0}" -f $overAuditingOnly.Count)
+    Write-Host ("  - Under-auditing:     {0}" -f $underAuditing.Count)
+    Write-Host ("  - Different mode:     {0}" -f $differentMode.Count)
 }
 
 if ($result.MissingCount -gt 0) {
@@ -856,8 +904,8 @@ exit 1
 # SIG # Begin signature block
 # MIIyhQYJKoZIhvcNAQcCoIIydjCCMnICAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCARJ6Keb3bFhkBg
-# xBboZMSr8479ydlOtrarX9o5WiCB9aCCK7QwggVvMIIEV6ADAgECAhBI/JO0YFWU
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCB9/OJBJ91zsuYN
+# BQzgDeQHujdi7grcsQa/l9pc0aeP+KCCK7QwggVvMIIEV6ADAgECAhBI/JO0YFWU
 # jTanyYqJ1pQWMA0GCSqGSIb3DQEBDAUAMHsxCzAJBgNVBAYTAkdCMRswGQYDVQQI
 # DBJHcmVhdGVyIE1hbmNoZXN0ZXIxEDAOBgNVBAcMB1NhbGZvcmQxGjAYBgNVBAoM
 # EUNvbW9kbyBDQSBMaW1pdGVkMSEwHwYDVQQDDBhBQUEgQ2VydGlmaWNhdGUgU2Vy
@@ -1094,34 +1142,34 @@ exit 1
 # CQYDVQQGEwJHQjEYMBYGA1UEChMPU2VjdGlnbyBMaW1pdGVkMSswKQYDVQQDEyJT
 # ZWN0aWdvIFB1YmxpYyBDb2RlIFNpZ25pbmcgQ0EgUjM2AhEAyu6yTXnXONjJZZfx
 # EYG4QDANBglghkgBZQMEAgEFAKBqMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEE
-# MBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBP
-# ghy98gdyLl+ls8SLo1D+8SIRXEHcdMO2g104zoUlSDANBgkqhkiG9w0BAQEFAASC
-# AgB/9Xsr4qgzT3b4J8kC1Pb41XzBQ5zGJ5kH3752gXTnT5D2k1OGpaZowGO7gLxG
-# GGgPdFXSPa6nrzb/7u91MaTiZTpGe6I4heHMUiUgrrEk7cJI5IuxtqEeQYV9N1Fm
-# pUk79Ib7onW3oCm9yhUZYx4fJEOCKRpHZ04P59z8rbyrIjyw5onJHnR0Q1NSkz9n
-# /kN4VK0IXifNTwMcYnY3j/fgfcqN36atHiWMkBz+UaLk9uuA5ExO8rOTiHUSqeBU
-# kJ4tv18hdvlefx8re8v7AIFXdlAxExgDUhi+LSmmim91gu3u3347dobCjAqV9MGk
-# sBUM6+x3FjNP3M3nfLPAiSnR2DR25/pD7DL+VMiH6oWKzOueJ/X3AcWjdxVXC06/
-# JfnH5ewKumPfzEBsAMGBqF9Nhgm0uFEnC4jO9pu12I5LySy0WZYEQRSlpJDBO4pv
-# KvpXxE/ReUbQzved0jiGiOEDkltyeeRLP9aiOl5GhLpcPbm1JsbO/+SBWVwaLY/V
-# EsbNsD8BTPW0+E+ES6v6dBDCZdXLXyRRlIWZa2AtlkqMIZSEo0J+ss58qSWxY/cy
-# AMjceviy873f4EHgNdMoR8Gg8c94YAUloJdeQWfWXm/e1eYu6nRyzD1WXkoNb4Yl
-# bTgrxUWBPTXcqTz6m0NPddhI93l2C7hYMAB5cij5VPFtcKGCAyMwggMfBgkqhkiG
+# MBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAv
+# 1dTP7MWSL7T6JG/SXaSwMSmXojbF3IU7fRxn8m6pnjANBgkqhkiG9w0BAQEFAASC
+# AgB8WEKBo94cTkZvN/7JCFHjb74s6w6KFL8NvPk5hRS9+yyeIJXK1KacY8qzH62P
+# S90wb+P9h2xJ48v3eh9teZV9Zk3E5r4Rpb+kadjqX9z48ZlERufJZNMULz1KrnEp
+# lzj4Ja6CCe7/mbvkP/HRwUZXX5XmufC60rM04+wRHScjNhQmGFU73OKRSojwTY9Z
+# X0KUr4QI8vdGq4jsoiPeoAKOZEUG+XwiDjThbLup1Y7bLhp7ymvbilnsgVwmFQQe
+# ShvNMnskE8KPvdL5mhG3w0xQ3+1J10twyLTeQ+knVjykgvz+8st+HuLYuGZk+sSB
+# v3DJBtrThjQj9sdOdKiDyMjm47fxQWeMTF6oF5Sr8m73cbQVejgzQTTa5isdu1lf
+# 7k1BmRZvS0tpgCAwOlbTAIKBGxlPYaKMhO1hbQWBbdjr9lPvV53gnbzyxNY2I4lo
+# 7BOfo/h0OUu1ZFfPtDL7kvZcyNw8vvp6xWZ6meSu04MvhEaauf5Q9Sl8ze++cU0F
+# pf+rHDClOpVsV9SQo3ZtcPdqJ3LicTkncS6EiwdgtIRsIjVV9QdUsaAaRxtveZ09
+# w8bwwzxI328iV+6blcGiyCpqO3qQaF+prOJKpn8BrX1Oz9li4kL+ATOn7FEkI9c+
+# yvfIfz/zKHjFjdGJFEaNUwDRkRhssfSivJPF38Te0LqqXKGCAyMwggMfBgkqhkiG
 # 9w0BCQYxggMQMIIDDAIBATBqMFUxCzAJBgNVBAYTAkdCMRgwFgYDVQQKEw9TZWN0
 # aWdvIExpbWl0ZWQxLDAqBgNVBAMTI1NlY3RpZ28gUHVibGljIFRpbWUgU3RhbXBp
 # bmcgQ0EgUjM2AhEApCk7bh7d16c0CIetek63JDANBglghkgBZQMEAgIFAKB5MBgG
-# CSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MDQxNjEz
-# NTYyOVowPwYJKoZIhvcNAQkEMTIEMGDzaXJJWjQn4Q4vZo4cWJlH1uXxG8p/oNXp
-# BfEH3hUzXUstC0MoCa31urBF4lazyDANBgkqhkiG9w0BAQEFAASCAgB70U1PcghY
-# oiS3lSub5CR2WxqsdxD8/RLWW9X5JoPDbOKCYGLDN+1BQtBy1uLZjeZSLPozYArH
-# 7Haa42wP7CyrxP5dADEApXrAteHji2rKjDXCm1T8Bju8Mvbn/Lti3riIIWL/AphT
-# hZO1fjlapsL6X+AKUrYpSeUiYIguw12JKOiTSggErs7532zIZ5JjFODUjM1JHMSd
-# Wk7bv8a7qpwt5TJS02G4Hi39ph0r1CpWu4IzHxsyyCeDqb8e9Mj135SFcV2SOrUb
-# zt8h3uk075hJBXMoHzoniwfdKeLzBtSxLvZkqHUdb4w8dr46H8jNF2Hjr70Swkdv
-# hompsP5B12cVx6BUOkL7lxrmzMHIDFn5Y8o0vQhjtzPw8n0REdAiS3OG4yfZUVKT
-# pS0hgAnWqA2az2f0UAOBuxFz1Iy8PV3M4cjC5x21enqAdXG4EjNpXjc+04YR0kID
-# bERJOqn+QF1nfb3he5Dokrld2umJWnWrsVicgKRG0l4I26WsMNLEA/CTHXz1EzrX
-# wG4TjHQgELKexUf5Yf4JWyhNhdp9Ft0Vv4UQ1LWvCS6epXaVALWCvOKA+Nko34f3
-# 0Xor7zmD+vxUmDjBD1HZnKug+dWhECr9k31ixky0sODQ2FKoZ85hyw4P18QijtAK
-# RAt/jScB7k7p4OGUKh2pJfpRAQcwzuAopw==
+# CSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MDQxNjE1
+# MjcwOVowPwYJKoZIhvcNAQkEMTIEMD+BzifW6LgrOnrB9mLsXKd53tsVAxjKSKcX
+# x6q5wcTtyLuUpMGiQLtHNconXxhivjANBgkqhkiG9w0BAQEFAASCAgBhrUhOeBb0
+# tJsJzolSKlo6ZNbU6oYTgjkkHdtrNo5WHTtb6H6l3SddH/SULYJXb/CXRoqZOrT2
+# 9jr/NyYUAAaKjZV9D6fMBkUS/HZdOEINtbREoSVtaCGSlfRLp7j4z1Vhbaoe9PCN
+# UhVtMsuRBH9XHZALxHBZcrh11/nBt7LDtZ/tKxcpZtIca2NzTTAuQ2K4Xc3rYEZt
+# zZzNdnqxSGD77Xzbf1TtFnnaUWM94X6aByMB80Xb6hkkJOHxIMV38J2l0nyjdVv4
+# zbIF0PSyRs8Y/YFsn10N2TY5Q2dxBOHPkV9w8zRZlmGqTQqbEDF353tnn62Z1p75
+# g4d3l4sO6QvbzCdVHknXSeXL+XjwrhVYN8znUMPo5idyR44/rpMB7xnjFUEWBqWd
+# sjrV7m4wetb9fzZbjCbEh/+5yZ6TAIF++0W+Ewc5/xjOHdwFhAXrp78X/RMCQ5Yj
+# nHYSfXIDyU7WVvWNr4QvTWgRTA68x1enDmI5HgPwvCn91GpZJyOfEpHiR/iq6A4L
+# r2OGEcW/52EOZkbPuA+mrOAi1wUaYS703Hc1aAkIzHDhOmPJD5xcfBpADJWW0obL
+# xKVSyVKIlFYxVmr3PK958ckLA1uaRnV+qQaJgM6mTW7kh4Dh8hImcbsJZYW4MAln
+# M4/7/AuzKoxGA+qSnZzOPIfm5wASQtd+2Q==
 # SIG # End signature block
