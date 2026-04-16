@@ -59,6 +59,11 @@
 .PARAMETER LinkEnabled
     Whether to link the GPO after creation. Default: $true
 
+.PARAMETER Server
+    Preferred domain controller to use for all Group Policy and Active
+    Directory operations. If omitted, the script resolves and pins the
+    target domain's PDC emulator.
+
 .PARAMETER WhatIf
     Shows what the script would do without making changes.
 
@@ -99,6 +104,7 @@ param(
     [switch]$HasADCS,
     [string]$TargetDomain,
     [switch]$AllDomains,
+    [string]$Server,
     [bool]$LinkEnabled = $true
 )
 
@@ -313,6 +319,47 @@ function Get-SortedMachineExtensionNames {
     return ($pairs -join '')
 }
 
+function Resolve-PreferredDomainController {
+    param(
+        [string]$DomainFQDN,
+        [string]$PreferredServer
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($PreferredServer)) {
+        return $PreferredServer
+    }
+
+    $domain = Get-ADDomain -Identity $DomainFQDN -Server $DomainFQDN
+    if (-not [string]::IsNullOrWhiteSpace($domain.PDCEmulator)) {
+        return $domain.PDCEmulator
+    }
+
+    return $DomainFQDN
+}
+
+function Get-GpoAdObjectWithRetry {
+    param(
+        [string]$Identity,
+        [string]$ServerName,
+        [int]$MaxAttempts = 6,
+        [int]$DelaySeconds = 2
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return Get-ADObject -Identity $Identity -Server $ServerName `
+                -Properties gPCMachineExtensionNames, versionNumber
+        }
+        catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+            if ($attempt -eq $MaxAttempts) {
+                throw
+            }
+
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+}
+
 # ============================================================================
 # CORE: Apply audit policy to a GPO via direct SYSVOL write + AD update
 # ============================================================================
@@ -321,16 +368,17 @@ function Set-HuntressAdvancedAuditPolicy {
     param(
         [Guid]$GpoId,
         [string]$DomainFQDN,
-        [string]$DomainDN
+        [string]$DomainDN,
+        [string]$ServerName
     )
 
     $gpoGuid    = $GpoId.ToString("B").ToUpper()
-    $machinePath = "\\$DomainFQDN\SYSVOL\$DomainFQDN\Policies\$gpoGuid\Machine"
+    $machinePath = "\\$ServerName\SYSVOL\$DomainFQDN\Policies\$gpoGuid\Machine"
     $auditDir    = Join-Path $machinePath "Microsoft\Windows NT\Audit"
     $secEditDir  = Join-Path $machinePath "Microsoft\Windows NT\SecEdit"
     $auditCsvPath = Join-Path $auditDir "audit.csv"
     $gptTmplPath  = Join-Path $secEditDir "GptTmpl.inf"
-    $gptIniPath   = Join-Path "\\$DomainFQDN\SYSVOL\$DomainFQDN\Policies\$gpoGuid" "GPT.INI"
+    $gptIniPath   = Join-Path "\\$ServerName\SYSVOL\$DomainFQDN\Policies\$gpoGuid" "GPT.INI"
 
     # Create directories and write audit.csv
     New-Item -ItemType Directory -Path $auditDir -Force | Out-Null
@@ -348,13 +396,12 @@ function Set-HuntressAdvancedAuditPolicy {
 
     # Update AD object: CSE extension names and version
     $gpoDN    = "CN=$gpoGuid,CN=Policies,CN=System,$DomainDN"
-    $adObject = Get-ADObject -Identity $gpoDN -Server $DomainFQDN `
-        -Properties gPCMachineExtensionNames, versionNumber
+    $adObject = Get-GpoAdObjectWithRetry -Identity $gpoDN -ServerName $ServerName
 
     $newExtensionNames = Get-SortedMachineExtensionNames -CurrentValue $adObject.gPCMachineExtensionNames
     $newVersion        = Get-UpdatedMachineVersion -CurrentVersionNumber ([int]$adObject.versionNumber)
 
-    Set-ADObject -Identity $gpoDN -Server $DomainFQDN -Replace @{
+    Set-ADObject -Identity $gpoDN -Server $ServerName -Replace @{
         gPCMachineExtensionNames = $newExtensionNames
         versionNumber            = $newVersion
     }
@@ -369,15 +416,16 @@ function Set-HuntressAdvancedAuditPolicy {
 function Set-HuntressRegistryPolicies {
     param(
         [Guid]$GpoId,
-        [string]$DomainFQDN
+        [string]$DomainFQDN,
+        [string]$ServerName
     )
 
     # Security Event Log: 512000 KB, OverwriteAsNeeded
-    Set-GPRegistryValue -Guid $GpoId -Domain $DomainFQDN `
+    Set-GPRegistryValue -Guid $GpoId -Domain $DomainFQDN -Server $ServerName `
         -Key "HKLM\Software\Policies\Microsoft\Windows\EventLog\Security" `
         -ValueName "MaxSize" -Type DWord -Value 512000 | Out-Null
 
-    Set-GPRegistryValue -Guid $GpoId -Domain $DomainFQDN `
+    Set-GPRegistryValue -Guid $GpoId -Domain $DomainFQDN -Server $ServerName `
         -Key "HKLM\Software\Policies\Microsoft\Windows\EventLog\Security" `
         -ValueName "Retention" -Type DWord -Value 0 | Out-Null
 
@@ -386,15 +434,15 @@ function Set-HuntressRegistryPolicies {
         "HKLM\SOFTWARE\Policies\Microsoft\Windows\PowerShell",
         "HKLM\SOFTWARE\Wow6432Node\Policies\Microsoft\Windows\PowerShell"
     )) {
-        Set-GPRegistryValue -Guid $GpoId -Domain $DomainFQDN `
+        Set-GPRegistryValue -Guid $GpoId -Domain $DomainFQDN -Server $ServerName `
             -Key "$root\ModuleLogging" `
             -ValueName "EnableModuleLogging" -Type DWord -Value 1 | Out-Null
 
-        Set-GPRegistryValue -Guid $GpoId -Domain $DomainFQDN `
+        Set-GPRegistryValue -Guid $GpoId -Domain $DomainFQDN -Server $ServerName `
             -Key "$root\ModuleLogging\ModuleNames" `
             -ValueName "*" -Type String -Value "*" | Out-Null
 
-        Set-GPRegistryValue -Guid $GpoId -Domain $DomainFQDN `
+        Set-GPRegistryValue -Guid $GpoId -Domain $DomainFQDN -Server $ServerName `
             -Key "$root\ScriptBlockLogging" `
             -ValueName "EnableScriptBlockLogging" -Type DWord -Value 1 | Out-Null
     }
@@ -409,18 +457,21 @@ function Deploy-HuntressGPOToDomain {
         [string]$DomainFQDN,
         [string]$Name,
         [bool]$Link,
+        [string]$PreferredServer,
         [System.Management.Automation.PSCmdlet]$CallerCmdlet
     )
 
-    $domainDN = (Get-ADDomain -Identity $DomainFQDN -Server $DomainFQDN).DistinguishedName
+    $serverName = Resolve-PreferredDomainController -DomainFQDN $DomainFQDN -PreferredServer $PreferredServer
+    $domainDN = (Get-ADDomain -Identity $DomainFQDN -Server $serverName).DistinguishedName
 
     Write-Host "`n------------------------------------------------------------" -ForegroundColor Cyan
     Write-Host "  Domain: $DomainFQDN" -ForegroundColor Cyan
     Write-Host "  DN:     $domainDN" -ForegroundColor Cyan
+    Write-Host "  Server: $serverName" -ForegroundColor Cyan
     Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
 
     # Check for existing GPO
-    $existing = Get-GPO -Name $Name -Domain $DomainFQDN -ErrorAction SilentlyContinue
+    $existing = Get-GPO -Name $Name -Domain $DomainFQDN -Server $serverName -ErrorAction SilentlyContinue
     if ($existing) {
         Write-Warning "  GPO '$Name' already exists in $DomainFQDN (ID: $($existing.Id)). Skipping."
         return $null
@@ -434,23 +485,23 @@ function Deploy-HuntressGPOToDomain {
     $gpo = $null
     try {
         # Create the GPO
-        $gpo = New-GPO -Name $Name -Domain $DomainFQDN `
+        $gpo = New-GPO -Name $Name -Domain $DomainFQDN -Server $serverName `
             -Comment "Huntress SIEM audit policy baseline. Created $(Get-Date -Format 'yyyy-MM-dd')."
         Write-Host "  Created GPO: $Name (ID: $($gpo.Id))" -ForegroundColor Green
 
         # Apply Advanced Audit Policy via direct SYSVOL write
-        Set-HuntressAdvancedAuditPolicy -GpoId $gpo.Id -DomainFQDN $DomainFQDN -DomainDN $domainDN
+        Set-HuntressAdvancedAuditPolicy -GpoId $gpo.Id -DomainFQDN $DomainFQDN -DomainDN $domainDN -ServerName $serverName
         Write-Host "  Applied Advanced Audit Policy ($($script:auditSettings.Count) subcategories)" -ForegroundColor DarkGreen
         Write-Host "  Applied SCENoApplyLegacyAuditPolicy=1, AuditBaseObjects=0" -ForegroundColor DarkGreen
 
         # Apply registry-based policies
-        Set-HuntressRegistryPolicies -GpoId $gpo.Id -DomainFQDN $DomainFQDN
+        Set-HuntressRegistryPolicies -GpoId $gpo.Id -DomainFQDN $DomainFQDN -ServerName $serverName
         Write-Host "  Applied Security Event Log: 512000 KB, OverwriteAsNeeded" -ForegroundColor DarkGreen
         Write-Host "  Applied PowerShell Module Logging + Script Block Logging" -ForegroundColor DarkGreen
 
         # Link at domain root
         if ($Link) {
-            New-GPLink -Guid $gpo.Id -Target $domainDN -Domain $DomainFQDN -LinkEnabled Yes | Out-Null
+            New-GPLink -Guid $gpo.Id -Target $domainDN -Domain $DomainFQDN -Server $serverName -LinkEnabled Yes | Out-Null
             Write-Host "  Linked GPO at domain root" -ForegroundColor Green
         } else {
             Write-Host "  GPO created but NOT linked (-LinkEnabled `$false)" -ForegroundColor Yellow
@@ -460,7 +511,7 @@ function Deploy-HuntressGPOToDomain {
         # Rollback: remove the partially-created GPO
         if ($null -ne $gpo) {
             Write-Warning "  Deployment failed, removing partially-created GPO..."
-            Remove-GPO -Guid $gpo.Id -Domain $DomainFQDN -Confirm:$false -ErrorAction SilentlyContinue
+            Remove-GPO -Guid $gpo.Id -Domain $DomainFQDN -Server $serverName -Confirm:$false -ErrorAction SilentlyContinue
         }
         throw
     }
@@ -507,6 +558,7 @@ if ($explicitWhatIf) {
     Write-Host ""
     Write-Host "[WhatIf] Planned deployment summary" -ForegroundColor DarkYellow
     Write-Host "[WhatIf] Target domain(s): $($domains -join ', ')" -ForegroundColor DarkYellow
+    Write-Host "[WhatIf] Preferred server: $(if ($Server) { $Server } else { 'Auto-resolve PDC emulator per domain' })" -ForegroundColor DarkYellow
     Write-Host "[WhatIf] Link after create: $LinkEnabled" -ForegroundColor DarkYellow
     Write-Host ("[WhatIf] Subcategories: {0} total ({1} S+F / {2} S / {3} F / {4} disabled)" -f $auditSettings.Count, $sf, $sOnly, $fOnly, $disabled) -ForegroundColor DarkYellow
     Write-Host "[WhatIf] Process Creation: $(if ($NoHuntressEDR) { 'Success (no EDR)' } else { 'No Auditing (EDR covers)' })" -ForegroundColor DarkYellow
@@ -522,6 +574,7 @@ foreach ($domain in $domains) {
         -DomainFQDN    $domain `
         -Name          $GPOName `
         -Link          $LinkEnabled `
+        -PreferredServer $Server `
         -CallerCmdlet  $PSCmdlet
 
     if ($gpo) {
@@ -579,8 +632,8 @@ if ($results.Count -gt 0) {
 # SIG # Begin signature block
 # MIIyhQYJKoZIhvcNAQcCoIIydjCCMnICAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAlbnWHXJXb2qZ3
-# V1uZQyaZXZTGVcWy9mtzvhAmjBrZuaCCK7QwggVvMIIEV6ADAgECAhBI/JO0YFWU
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCLzLXLi8P8MjkK
+# Egc1sNijVJwo0QViF/JahmdC6yIfZqCCK7QwggVvMIIEV6ADAgECAhBI/JO0YFWU
 # jTanyYqJ1pQWMA0GCSqGSIb3DQEBDAUAMHsxCzAJBgNVBAYTAkdCMRswGQYDVQQI
 # DBJHcmVhdGVyIE1hbmNoZXN0ZXIxEDAOBgNVBAcMB1NhbGZvcmQxGjAYBgNVBAoM
 # EUNvbW9kbyBDQSBMaW1pdGVkMSEwHwYDVQQDDBhBQUEgQ2VydGlmaWNhdGUgU2Vy
@@ -817,34 +870,34 @@ if ($results.Count -gt 0) {
 # CQYDVQQGEwJHQjEYMBYGA1UEChMPU2VjdGlnbyBMaW1pdGVkMSswKQYDVQQDEyJT
 # ZWN0aWdvIFB1YmxpYyBDb2RlIFNpZ25pbmcgQ0EgUjM2AhEAyu6yTXnXONjJZZfx
 # EYG4QDANBglghkgBZQMEAgEFAKBqMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEE
-# MBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCb
-# DSjCKK6KLvqQ9AZgHS5eZRu8nbvHMPEbNhxG9ZDvsjANBgkqhkiG9w0BAQEFAASC
-# AgCnxu0JCiOqxuoDE2EMPtzmqIGtZv8iPEPBg94bHhc3p6fm9KAIEWVUXwu/3UyW
-# qZHY5Q/x17AyzxconH0xu+9XLLNeMKoXpd7xEX0y83e35z2C4xKRsyiMtRDgn0BO
-# hdMqUMI791/YTLkw3Y84MNNoSzoTLJ5WfENSXduTfbzSSgbYUOaHj/dtIsi1/4SD
-# 47JFVU13srZh11f3H12qz5EOn0HkGlNV3nM19mrFos3vAZtQQRmCz1YYl2yExnfX
-# kQuMgNngHGl6ufUZnbjy2qk90pRgsBe5xnrdWHSTOv9+8x/jZrpP/82f3cm7GsdR
-# mQrhBhwugDhEe4/zzPEYpPDM7q1hDq3E0kAuyn7gYVmiBDxazGQZJkICKzfBg6aM
-# KQ1+AJxfBgNSEnQ9mzQqIxejwFqCSpYT06XHBmU9SlaGnAW9yp8AziUai82QJx9y
-# 7KJpnZw+hxk9GwxVf3fb3f9F0P4ryomkaJQim5RzoYo4BN4PCWjL3l0yuWBz7I4j
-# FaiOGsRnaB2mBDcglr36O+MU9rROVr6W9hnE19u2fXdIMszUFDsUvHjuEqhwGQJK
-# Cv+MhmHk1Xgh707IfURT5tKhT/Yc8iTXS2HtbLMLmVnLyp/UM1iDNcjkBgt//wBt
-# CuEO6bbzxu5BlRboM1mWZiChudhjQlJwyoejpC5Bo6N6dqGCAyMwggMfBgkqhkiG
+# MBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBJ
+# LP1wJ2IAxFxEQEKxNgRK8hZaSYTANhjg+8lGbMgmBzANBgkqhkiG9w0BAQEFAASC
+# AgBG37lMxdI71FMct6dnctAQnTUAAziLW7v7AmQ+JFnGsGH0Q6GrfRDijnIBrhvH
+# Zb836gMSG6ordZWhOlw311RYggXOrCKih02KVVh0ji/ywOm+wTrhim+ZCu1Serp5
+# 5RNLPU4HB30QMUWkXndXdFOkdx8FMvvyQxuec4r7T5vckEm2WYonByxloB8VBnBi
+# 1a4s6oS/p4DqN/hCX4O+3slqpY7BNJlBQJZKAeyrGczJLPt2n0FW5ZhC3Ag/Udt+
+# 1UFYiTolCp7lauFWhitBFTXTnPrNSaVA7b/RXzlpZpTvZpNGxHJzeXvefly+4GWv
+# GVw0FlRe3M0SR8tGjoFIzf7lWrAYKj23QEmeidprBtoCO2+vynGbiaFsSs53ld5O
+# XjUO3ZHNUAe+/RdjfFkbpPVRPWjZxhNqYRdeOGSj0n6X0+AF2TpGMYnxj8xqqfen
+# plN7mnLaN9EJsVoLwPObd8D3cMg90LnlDC7kT/R83dODSpmDIx7GAXwUaPuzH//p
+# sTVQmVuD00NqMNpXvEtcajdcBOJhvd9XUpBg8UqTDdddnCp+fEmRSaeBdYcSfprK
+# WaW+4lNrMUVdNFJll/ObtIT5ff21PVLjX/NeIFQJE2K8fj2f8KjF+kCu5NJ9hvA5
+# IJbQvs5mw303/UhuWhivvsrinDMfsn2eVHSb+SMfIJahkaGCAyMwggMfBgkqhkiG
 # 9w0BCQYxggMQMIIDDAIBATBqMFUxCzAJBgNVBAYTAkdCMRgwFgYDVQQKEw9TZWN0
 # aWdvIExpbWl0ZWQxLDAqBgNVBAMTI1NlY3RpZ28gUHVibGljIFRpbWUgU3RhbXBp
 # bmcgQ0EgUjM2AhEApCk7bh7d16c0CIetek63JDANBglghkgBZQMEAgIFAKB5MBgG
-# CSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MDQxNjEz
-# MjQwMFowPwYJKoZIhvcNAQkEMTIEMIr8u1PAQ4yH1V4DPiKt88dRILPb43wUw/ZQ
-# +T5fwFqgX5KP3cy3WylNLXgZNL82FDANBgkqhkiG9w0BAQEFAASCAgBHNbOYYahS
-# /n9I8YMycRr+hWAwtK5QsOwnc4vXN+UdFENkK0E9kUHliT/JOJvkKBagVk+bXcw7
-# zMcjVOeDVlGZ54Q+OGPXKLEf6yzB26xk7RERNqTr0AnizZFWqOB9VrC6ik3fMnjH
-# FwchreuZMV4Ow9aDtwPQx3r7Z0nr0vuNFlRqaxmS1zg7WQla3r3RD9riohqI9f0r
-# C5wei0JEgFxs+YxJ4J63mP/gz0v0Kxd8MS47z2PEVufi0OhfvLxPdfDx2NBQSwzX
-# N252QLrZ1YHD852RviCHyn5F2F3jhCuqJdXBQoVeXfQC7Ul6HFxOZvmrgF/Kh2K1
-# jDANLwOvvbVbqMYLAVkuOSoM1yx61JMx/2wRb/Btbq1mGbQ8fTriLj2SWsRE4yNu
-# mxk/DWuVscxtZjkhTU3iVDiAxKQ4p2R0B9fvkaRWcWiBlOjp8K8J2xFl61sKUB2V
-# KcM2AnYFT0QDQ/TqYj0RU8LyTaeI+SRgZszfz35E1iB3lbBnP9EORhDD6UuVkt87
-# 9POAqNAqWxdon0V3Hb4xEret0DmbGw4EjkZ82wbWift7AHYGKMzmu6KxvlgdLS5a
-# pdl5PvzRuqUde4+2ud6XmKRt7W2pFP4YFLqGPRNNNh18iUtuWKFIkDg0pkh8H6Mm
-# 3yzQnLy9Y90GgghaPwV1Nx1YPKlUU86kHQ==
+# CSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MDQxNjE1
+# MDY0NlowPwYJKoZIhvcNAQkEMTIEMD8Xzp/MnML0LTjg/0LFmAGx7+GXWzx6Anj5
+# BYCAwwO4+8m4rGc2BqQ62rhVVYMywDANBgkqhkiG9w0BAQEFAASCAgAnkSRSc838
+# 3rtf7uv8yyGrOcVsp3Zz1uQSctZDsq+riFEJhoU5qNCdF1bpcl8ihwuKFn4DHNPw
+# AjJz9TPbc48bmvi0lId6dkkldzlb7BYf29xkMww6RvcaHnms2bK3pASWUh6vQETu
+# T+z4LpbpeSKOQHTYGiooPQsai8a6OXW65csQAF5fDl1Q8fqMSz4rgompie04fSVt
+# pwLvTzoogJIeF72A5n9W4KfXwaD+epG/hP0UHWhwvpJtFyNCQJ76uLQLW7ja1YFa
+# q7cTnlLCs/3wVa3hmsz2JOYSmwvC05CZMeM0fi60dLWGxzU1fN7CQVfToQMWAcZA
+# 0AOzTv3zF1v41DKcv4dg+tq/W1AKRvBopJlahJNdreLN+KOavg5WOIWeQhXPdv1j
+# +5PvDJdBeRXe61SGPkM3RwJIXE7buo68rxvcHiuzgkiQ/w196n3zq6UUe/hFXNtx
+# RFmF5Xr7rMJZN++BdjDYWBFsoio1Flrm1ydrx1CB51XhB7NGCenZRh9jBWqYlZXU
+# rbe5LVls+qqIZJVjgdivgKKGBa2s295eL5enlGyk7gbCgosiAG4M5ohidmUR4R0l
+# hMMp2emNBQihx4pl+qQ9IsEtqYCPYkEkWr26XDb3SqzMvDA26MJ5B0pj9JBJaPik
+# EC1AhCJY0wxbIfbXZXmVgmtuMannKV9YWw==
 # SIG # End signature block
